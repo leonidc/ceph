@@ -21,7 +21,6 @@
 #include "common/Timer.h"
 #include "common/LogClient.h"
 
-#include "client/Client.h"
 #include "mon/MonClient.h"
 #include "osdc/Objecter.h"
 #include "messages/MNVMeofGwMap.h"

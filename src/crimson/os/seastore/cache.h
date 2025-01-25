@@ -3,14 +3,13 @@
 
 #pragma once
 
-#include <iostream>
-
 #include "seastar/core/shared_future.hh"
 
 #include "include/buffer.h"
 
 #include "crimson/common/errorator.h"
 #include "crimson/common/errorator-loop.h"
+#include "crimson/os/seastore/backref_entry.h"
 #include "crimson/os/seastore/cached_extent.h"
 #include "crimson/os/seastore/extent_placement_manager.h"
 #include "crimson/os/seastore/logging.h"
@@ -37,86 +36,6 @@ template <
 class FixedKVBtree;
 class BackrefManager;
 class SegmentProvider;
-
-struct backref_entry_t {
-  backref_entry_t(
-    const paddr_t paddr,
-    const laddr_t laddr,
-    const extent_len_t len,
-    const extent_types_t type,
-    const journal_seq_t seq)
-    : paddr(paddr),
-      laddr(laddr),
-      len(len),
-      type(type),
-      seq(seq)
-  {}
-  backref_entry_t(alloc_blk_t alloc_blk)
-    : paddr(alloc_blk.paddr),
-      laddr(alloc_blk.laddr),
-      len(alloc_blk.len),
-      type(alloc_blk.type)
-  {}
-  paddr_t paddr = P_ADDR_NULL;
-  laddr_t laddr = L_ADDR_NULL;
-  extent_len_t len = 0;
-  extent_types_t type =
-    extent_types_t::ROOT;
-  journal_seq_t seq;
-  friend bool operator< (
-    const backref_entry_t &l,
-    const backref_entry_t &r) {
-    return l.paddr < r.paddr;
-  }
-  friend bool operator> (
-    const backref_entry_t &l,
-    const backref_entry_t &r) {
-    return l.paddr > r.paddr;
-  }
-  friend bool operator== (
-    const backref_entry_t &l,
-    const backref_entry_t &r) {
-    return l.paddr == r.paddr;
-  }
-
-  using set_hook_t =
-    boost::intrusive::set_member_hook<
-      boost::intrusive::link_mode<
-	boost::intrusive::auto_unlink>>;
-  set_hook_t backref_set_hook;
-  using backref_set_member_options = boost::intrusive::member_hook<
-    backref_entry_t,
-    set_hook_t,
-    &backref_entry_t::backref_set_hook>;
-  using multiset_t = boost::intrusive::multiset<
-    backref_entry_t,
-    backref_set_member_options,
-    boost::intrusive::constant_time_size<false>>;
-
-  struct cmp_t {
-    using is_transparent = paddr_t;
-    bool operator()(
-      const backref_entry_t &l,
-      const backref_entry_t &r) const {
-      return l.paddr < r.paddr;
-    }
-    bool operator()(const paddr_t l, const backref_entry_t &r) const {
-      return l < r.paddr;
-    }
-    bool operator()(const backref_entry_t &l, const paddr_t r) const {
-      return l.paddr < r;
-    }
-  };
-};
-
-std::ostream &operator<<(std::ostream &out, const backref_entry_t &ent);
-
-using backref_entry_ref = std::unique_ptr<backref_entry_t>;
-using backref_entry_mset_t = backref_entry_t::multiset_t;
-using backref_entry_refs_t = std::vector<backref_entry_ref>;
-using backref_entryrefs_by_seq_t = std::map<journal_seq_t, backref_entry_refs_t>;
-using backref_entry_query_set_t = std::set<
-    backref_entry_t, backref_entry_t::cmp_t>;
 
 /**
  * Cache
@@ -205,6 +124,7 @@ public:
   TransactionRef create_transaction(
       Transaction::src_t src,
       const char* name,
+      cache_hint_t cache_hint,
       bool is_weak) {
     LOG_PREFIX(Cache::create_transaction);
 
@@ -218,7 +138,8 @@ public:
       [this](Transaction& t) {
         return on_transaction_destruct(t);
       },
-      ++next_id
+      ++next_id,
+      cache_hint
     );
     SUBDEBUGT(seastore_t, "created name={}, source={}, is_weak={}",
               *ret, name, src, is_weak);
@@ -365,7 +286,7 @@ public:
     SUBDEBUGT(seastore_cache, "{} {} is present in cache -- {}",
               t, type, offset, *ret);
     t.add_to_read_set(ret);
-    touch_extent(*ret, &t_src);
+    touch_extent(*ret, &t_src, t.get_cache_hint());
     return ret->wait_io().then([ret] {
       return get_extent_if_cached_iertr::make_ready_future<
         CachedExtentRef>(ret);
@@ -422,7 +343,7 @@ public:
                 t, T::TYPE, offset, length);
       auto f = [&t, this, t_src](CachedExtent &ext) {
         t.add_to_read_set(CachedExtentRef(&ext));
-        touch_extent(ext, &t_src);
+        touch_extent(ext, &t_src, t.get_cache_hint());
       };
       return trans_intr::make_interruptible(
         do_get_caching_extent<T>(
@@ -470,7 +391,7 @@ public:
       ++stats.access.s.load_absent;
 
       t.add_to_read_set(CachedExtentRef(&ext));
-      touch_extent(ext, &t_src);
+      touch_extent(ext, &t_src, t.get_cache_hint());
     };
     return trans_intr::make_interruptible(
       do_get_caching_extent<T>(
@@ -568,7 +489,7 @@ public:
             ++access_stats.cache_lru;
             ++stats.access.s.cache_lru;
           }
-          touch_extent(*p_extent, &t_src);
+          touch_extent(*p_extent, &t_src, t.get_cache_hint());
         } else {
           if (p_extent->is_dirty()) {
             ++access_stats.trans_dirty;
@@ -915,7 +836,7 @@ private:
                 t, type, offset, length, laddr);
       auto f = [&t, this, t_src](CachedExtent &ext) {
 	t.add_to_read_set(CachedExtentRef(&ext));
-	touch_extent(ext, &t_src);
+	touch_extent(ext, &t_src, t.get_cache_hint());
       };
       return trans_intr::make_interruptible(
 	do_get_caching_extent_by_type(
@@ -957,7 +878,7 @@ private:
       ++stats.access.s.load_absent;
 
       t.add_to_read_set(CachedExtentRef(&ext));
-      touch_extent(ext, &t_src);
+      touch_extent(ext, &t_src, t.get_cache_hint());
     };
     return trans_intr::make_interruptible(
       do_get_caching_extent_by_type(
@@ -984,7 +905,7 @@ private:
     for (auto it = start_iter;
 	 it != end_iter;
 	 it++) {
-      res.emplace(it->paddr, it->laddr, it->len, it->type, it->seq);
+      res.emplace(it->paddr, it->laddr, it->len, it->type);
     }
     return res;
   }
@@ -1553,11 +1474,10 @@ private:
   /// Update lru for access to ref
   void touch_extent(
       CachedExtent &ext,
-      const Transaction::src_t* p_src)
+      const Transaction::src_t* p_src,
+      cache_hint_t hint)
   {
-    if (p_src &&
-	is_background_transaction(*p_src) &&
-	is_logical_type(ext.get_type())) {
+    if (hint == CACHE_HINT_NOCACHE && is_logical_type(ext.get_type())) {
       return;
     }
     if (ext.is_stable_clean() && !ext.is_placeholder()) {
@@ -1907,9 +1827,23 @@ private:
   seastar::metrics::metric_group metrics;
   void register_metrics();
 
-  void backref_batch_update(
-    std::vector<backref_entry_ref> &&,
-    const journal_seq_t &);
+  void apply_backref_mset(
+      backref_entry_refs_t& backref_entries) {
+    for (auto& entry : backref_entries) {
+      backref_entry_mset.insert(*entry);
+    }
+  }
+
+  void apply_backref_byseq(
+      backref_entry_refs_t&& backref_entries,
+      const journal_seq_t& seq);
+
+  void commit_backref_entries(
+      backref_entry_refs_t&& backref_entries,
+      const journal_seq_t& seq) {
+    apply_backref_mset(backref_entries);
+    apply_backref_byseq(std::move(backref_entries), seq);
+  }
 
   /// Add extent to extents handling dirty and refcounting
   ///

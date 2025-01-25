@@ -7,6 +7,7 @@
 #include "crimson/common/log.h"
 
 #include "crimson/os/seastore/btree/fixed_kv_node.h"
+#include "crimson/os/seastore/lba_mapping.h"
 
 namespace {
   [[maybe_unused]] seastar::logger& logger() {
@@ -37,12 +38,6 @@ void intrusive_ptr_release(CachedExtent *ptr)
 }
 
 #endif
-
-bool is_backref_mapped_extent_node(const CachedExtentRef &extent) {
-  return extent->is_logical()
-    || is_lba_node(extent->get_type())
-    || extent->get_type() == extent_types_t::TEST_BLOCK_PHYSICAL;
-}
 
 std::ostream &operator<<(std::ostream &out, CachedExtent::extent_state_t state)
 {
@@ -148,38 +143,18 @@ void LogicalCachedExtent::on_replace_prior() {
   parent->children[off] = this;
 }
 
+void LogicalCachedExtent::maybe_set_intermediate_laddr(LBAMapping &mapping) {
+  laddr = mapping.is_indirect()
+    ? mapping.get_intermediate_base()
+    : mapping.get_key();
+}
+
 parent_tracker_t::~parent_tracker_t() {
   // this is parent's tracker, reset it
   auto &p = (FixedKVNode<laddr_t>&)*parent;
   if (p.my_tracker == this) {
     p.my_tracker = nullptr;
   }
-}
-
-std::ostream &operator<<(std::ostream &out, const LBAMapping &rhs)
-{
-  out << "LBAMapping(" << rhs.get_key()
-      << "~0x" << std::hex << rhs.get_length() << std::dec
-      << "->" << rhs.get_val();
-  if (rhs.is_indirect()) {
-    out << ",indirect(" << rhs.get_intermediate_base()
-        << "~0x" << std::hex << rhs.get_intermediate_length()
-        << "@0x" << rhs.get_intermediate_offset() << std::dec
-        << ")";
-  }
-  out << ")";
-  return out;
-}
-
-std::ostream &operator<<(std::ostream &out, const lba_pin_list_t &rhs)
-{
-  bool first = true;
-  out << '[';
-  for (const auto &i: rhs) {
-    out << (first ? "" : ",") << *i;
-    first = false;
-  }
-  return out << ']';
 }
 
 bool BufferSpace::is_range_loaded(extent_len_t offset, extent_len_t length) const

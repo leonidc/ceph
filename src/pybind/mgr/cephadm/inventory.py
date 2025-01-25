@@ -438,6 +438,7 @@ class SpecStore():
             for key_attr in [
                 'server_key',
                 'client_key',
+                'encryption_key',
             ]:
                 key = getattr(nvmeof_spec, key_attr, None)
                 if key:
@@ -490,6 +491,7 @@ class SpecStore():
             self.mgr.cert_key_store.rm_cert('nvmeof_root_ca_cert', service_name=spec.service_name())
             self.mgr.cert_key_store.rm_key('nvmeof_server_key', service_name=spec.service_name())
             self.mgr.cert_key_store.rm_key('nvmeof_client_key', service_name=spec.service_name())
+            self.mgr.cert_key_store.rm_key('nvmeof_encryption_key', service_name=spec.service_name())
 
     def get_created(self, spec: ServiceSpec) -> Optional[datetime.datetime]:
         return self.spec_created.get(spec.service_name())
@@ -519,6 +521,13 @@ class SpecStore():
             self._save(name)
         else:
             self.mgr.log.warning(f'Attempted to mark unknown service "{name}" as having been configured')
+
+    def get_specs_by_type(self, service_type: str) -> Mapping[str, ServiceSpec]:
+        return {
+            service_name: spec
+            for service_name, spec in self._specs.items()
+            if service_type == spec.service_type
+        }
 
 
 class ClientKeyringSpec(object):
@@ -1336,10 +1345,15 @@ class HostCache():
 
     def get_daemons_by_type(self, service_type: str, host: str = '') -> List[orchestrator.DaemonDescription]:
         assert service_type not in ['keepalived', 'haproxy']
-
         daemons = self.daemons[host].values() if host else self._get_daemons()
-
         return [d for d in daemons if d.daemon_type in service_to_daemon_types(service_type)]
+
+    def get_daemons_by_types(self, daemon_types: List[str]) -> List[str]:
+        daemon_names = []
+        for daemon_type in daemon_types:
+            for dd in self.get_daemons_by_type(daemon_type):
+                daemon_names.append(dd.name())
+        return daemon_names
 
     def get_daemon_types(self, hostname: str) -> Set[str]:
         """Provide a list of the types of daemons on the host"""
@@ -1969,6 +1983,7 @@ class CertKeyStore():
         'ingress_ssl_key',
         'nvmeof_server_key',
         'nvmeof_client_key',
+        'nvmeof_encryption_key',
     ]
 
     known_certs: Dict[str, Any] = {}
@@ -2005,6 +2020,7 @@ class CertKeyStore():
             'ingress_ssl_key': {},  # service-name -> key
             'nvmeof_server_key': {},  # service-name -> key
             'nvmeof_client_key': {},  # service-name -> key
+            'nvmeof_encryption_key': {},  # service-name -> key
         }
 
     def get_cert(self, entity: str, service_name: str = '', host: str = '') -> str:
@@ -2032,8 +2048,8 @@ class CertKeyStore():
             var = service_name if entity in self.service_name_cert else host
             j = {}
             self.known_certs[entity][var] = cert_obj
-            for service_name in self.known_certs[entity].keys():
-                j[var] = Cert.to_json(self.known_certs[entity][var])
+            for cert_key in self.known_certs[entity]:
+                j[cert_key] = Cert.to_json(self.known_certs[entity][cert_key])
         else:
             self.known_certs[entity] = cert_obj
             j = Cert.to_json(cert_obj)
