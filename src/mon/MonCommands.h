@@ -1459,6 +1459,28 @@ COMMAND("nvme-gw listeners"
 	" show all nvmeof gateways listeners within (pool, group)",
 	"mon", "r")
 
+COMMAND("import-migration put-metadata"
+   " name=pool,type=CephString"
+   " name=image,type=CephString"
+   " name=migration_id,type=CephString"
+   " name=key_ref,type=CephString",
+   "Store migration metadata in monitor DB",
+   "mon", "rw")
+
+COMMAND("import-migration get-metadata"
+   " name=pool,type=CephString"
+   " name=image,type=CephString"
+   " name=migration_id,type=CephString",
+   "Retrieve migration metadata from monitor DB",
+   "mon", "r")
+
+COMMAND("import-migration erase-metadata"
+   " name=pool,type=CephString"
+   " name=image,type=CephString"
+   " name=migration_id,type=CephString",
+   "Erase migration metadata from monitor DB",
+   "mon", "rw")
+
 // these are tell commands that were implemented as CLI commands in
 // the broken pre-octopus way that we want to allow to work when a
 // monitor has upgraded to octopus+ but the monmap min_mon_release is

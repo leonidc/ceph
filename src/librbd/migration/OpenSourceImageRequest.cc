@@ -22,6 +22,27 @@
 namespace librbd {
 namespace migration {
 
+  static int get_config_key(librados::Rados& rados, const std::string& key,
+                     std::string* value) {
+  std::string cmd =
+    "{"
+      "\"prefix\": \"config-key get\", "
+      "\"key\": \"" + key + "\""
+    "}";
+
+  bufferlist out_bl;
+
+  int r = rados.mon_command(std::move(cmd), {}, &out_bl, nullptr);
+  if (r == -EINVAL) {
+    return -EOPNOTSUPP;
+  } else if (r < 0 && r != -ENOENT) {
+    return r;
+  }
+
+  *value = out_bl.to_str();
+  return 0;
+}
+
 template <typename I>
 OpenSourceImageRequest<I>::OpenSourceImageRequest(
     librados::IoCtx& dst_io_ctx, I* dst_image_ctx, uint64_t src_snap_id,
@@ -74,7 +95,12 @@ template <typename I>
 void OpenSourceImageRequest<I>::open_native(
     const json_spirit::mObject& source_spec_object, bool import_only) {
   ldout(m_cct, 10) << dendl;
-
+  std::string fsid;
+  auto it_fsid = source_spec_object.find("source_cluster_fsid");
+  if (it_fsid != source_spec_object.end()) {
+    fsid = it_fsid->second.get_str();
+    ldout(m_cct, 5) << "open_native: found fsid in source spec " << fsid << dendl;
+  }
   int r = NativeFormat<I>::create_image_ctx(m_dst_io_ctx, source_spec_object,
                                             import_only, m_src_snap_id,
                                             m_src_image_ctx, m_src_rados);
@@ -84,7 +110,15 @@ void OpenSourceImageRequest<I>::open_native(
     finish(r);
     return;
   }
-
+  std::string value;
+  r = get_config_key(**m_src_rados, "migration/fsid/" + fsid, &value);
+  if (r < 0) {
+    lderr(reinterpret_cast<CephContext*>((*m_src_rados)->cct()))
+	<< "failed to fetch secret key from the monitor: "
+	<< cpp_strerror(r) << dendl;
+    return ;
+  }
+  ldout(m_cct, 5) << " get value by key " <<  fsid <<" got "<< value << dendl;
   auto src_image_ctx = *m_src_image_ctx;
   src_image_ctx->child = m_dst_image_ctx;
 

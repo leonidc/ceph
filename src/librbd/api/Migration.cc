@@ -39,7 +39,7 @@
 #include "librbd/migration/NativeFormat.h"
 #include "librbd/mirror/DisableRequest.h"
 #include "librbd/mirror/EnableRequest.h"
-
+//#include <rados/librados.hpp>
 #include <boost/scope_exit.hpp>
 
 #include <shared_mutex> // for std::shared_lock
@@ -515,6 +515,107 @@ int Migration<I>::prepare(librados::IoCtx& io_ctx,
   return r;
 }
 
+constexpr const char* SPEC_SECRET_KEY = "secret_key";
+
+static int get_config_key(librados::Rados& rados, const std::string& key,
+                   std::string* value) {
+  std::string cmd =
+    "{"
+      "\"prefix\": \"config-key get\", "
+      "\"key\": \"" + key + "\""
+    "}";
+
+  bufferlist out_bl;
+
+  int r = rados.mon_command(std::move(cmd), {}, &out_bl, nullptr);
+  if (r == -EINVAL) {
+    return -EOPNOTSUPP;
+  } else if (r < 0 && r != -ENOENT) {
+    return r;
+  }
+
+  *value = out_bl.to_str();
+  return 0;
+}
+
+static int set_config_key(librados::Rados& rados, const std::string& key,
+                   const std::string& value) {
+  std::string cmd;
+  if (value.empty()) {
+    cmd = "{"
+            "\"prefix\": \"config-key rm\", "
+            "\"key\": \"" + key + "\""
+          "}";
+  } else {
+    cmd = "{"
+            "\"prefix\": \"config-key set\", "
+            "\"key\": \"" + key + "\", "
+            "\"val\": \"" + value + "\""
+          "}";
+  }
+  bufferlist out_bl;
+
+  int r = rados.mon_command(std::move(cmd), {}, &out_bl, nullptr);
+  if (r == -EINVAL) {
+    return -EOPNOTSUPP;
+  } else if (r < 0) {
+    return r;
+  }
+
+  return 0;
+}
+
+static int try_get_fsid_secret_key(json_spirit::mObject source_spec_object,
+				   librados::IoCtx& dest_io_ctx) {
+    std::string secret_key;
+    auto cct = reinterpret_cast<CephContext *>(dest_io_ctx.cct());
+    auto it = source_spec_object.find("secret_key");
+    if (it != source_spec_object.end()) {
+      try {
+        secret_key = it->second.get_str();
+        ldout(cct, 5) << "found secret_key in source spec " << secret_key << dendl;
+      } catch (std::runtime_error&) {
+        lderr(cct) << "secret_key must be a string" << dendl;
+        return -EINVAL;
+      }
+
+      std::string fsid;
+      auto it_fsid = source_spec_object.find("source_cluster_fsid");
+      if (it_fsid != source_spec_object.end()) {
+        fsid = it_fsid->second.get_str();
+        ldout(cct, 5) << "found fsid in source spec " << fsid << dendl;
+      } else {
+        lderr(cct) << "source_cluster_fsid missing in spec" << dendl;
+        return -EINVAL;
+      }
+      source_spec_object.erase("secret_key"); // need to remove the key from the spec
+      std::string sanitized_source_spec =
+          json_spirit::write(source_spec_object);
+      ldout(cct, 5) << "sanitized source spec: "
+                     << sanitized_source_spec << dendl;
+      librados::Rados rados(dest_io_ctx);
+      int r = set_config_key(rados,  "migration/fsid/" + fsid, secret_key);
+      if (r < 0) {
+  	lderr(reinterpret_cast<CephContext*>(rados.cct()))
+  	    << "failed to store secret key in monitor: "
+  	    << cpp_strerror(r) << dendl;
+  	return r;
+      }
+      ldout(cct, 5) << "key set " <<  fsid << dendl;
+      std::string value;
+      r = get_config_key(rados, "migration/fsid/" + fsid, &value);
+      if (r < 0) {
+        lderr(reinterpret_cast<CephContext*>(rados.cct()))
+           << "failed to fetch secret key from the monitor: "
+           << cpp_strerror(r) << dendl;
+        return r;
+      }
+      ldout(cct, 5) << " get value by key " <<  fsid <<" got "<< value << dendl;
+    }
+    return 0;
+}
+
+
 template <typename I>
 int Migration<I>::prepare_import(
     const std::string& source_spec, librados::IoCtx& dest_io_ctx,
@@ -528,6 +629,20 @@ int Migration<I>::prepare_import(
   ldout(cct, 10) << source_spec << " -> "
                  << dest_io_ctx.get_pool_name() << "/"
                  << dest_image_name << ", opts=" << opts << dendl;
+
+  // use json-spirit to clean-up json formatting
+  json_spirit::mObject source_spec_object;
+  json_spirit::mValue json_root;
+  if(json_spirit::read(source_spec, json_root)) {
+    try {
+      source_spec_object = json_root.get_obj();
+    } catch (std::runtime_error&) {
+      lderr(cct) << "failed to clean source spec" << dendl;
+      return -EINVAL;
+    }
+  }
+
+  try_get_fsid_secret_key(source_spec_object,  dest_io_ctx);
 
   I* src_image_ctx;
   librados::Rados* src_rados;
@@ -561,17 +676,6 @@ int Migration<I>::prepare_import(
 
   ldout(cct, 20) << "updated opts=" << opts << dendl;
 
-  // use json-spirit to clean-up json formatting
-  json_spirit::mObject source_spec_object;
-  json_spirit::mValue json_root;
-  if(json_spirit::read(source_spec, json_root)) {
-    try {
-      source_spec_object = json_root.get_obj();
-    } catch (std::runtime_error&) {
-      lderr(cct) << "failed to clean source spec" << dendl;
-      return -EINVAL;
-    }
-  }
 
   auto dst_image_ctx = I::create(
     dest_image_name, util::generate_image_id(dest_io_ctx), nullptr,
